@@ -407,19 +407,18 @@ class EndToEndPipeline:
         n_onesided = n_fft // 2 + 1
 
         # One-sided frequency bins (Hz) for P5
-        all_freq_bins       = self._dsp.frequency_bins()        # (n_fft,)
+        all_freq_bins       = self._dsp.frequency_bins()
         freq_bins_onesided  = all_freq_bins[:n_onesided].astype(np.float32)
 
         # P3 streaming framer for P2→P3 buffering
         framer = self._dsp.new_streaming_framer()
 
-        # OLA accumulation buffer (owned by P3 via its inverse())
-        # We accumulate reconstructed frames here using P3's synthesis window.
-        win_len    = self._dsp_config.window_length
-        hop_len    = self._dsp_config.hop_length
-        ola_buffer = np.zeros(min_len + win_len * 2, dtype=np.float32)
-        ola_norm   = np.zeros(min_len + win_len * 2, dtype=np.float32)
-        window     = self._dsp.window  # synthesis window from P3
+        # Person 3 owns the complete ISTFT/overlap-add operation.
+        # Integration only collects enhanced spectra and performs one
+        # batch inverse after all frames have been processed.
+        win_len = self._dsp_config.window_length
+        hop_len = self._dsp_config.hop_length
+        enhanced_spectra: List[np.ndarray] = []
 
         # NLMS block → per-block SNR mapping (for passing to P5)
         block_size   = self.config.nlms.block_size
@@ -443,7 +442,7 @@ class EndToEndPipeline:
 
             for waveform_frame in complete_frames:
                 # ---- Person 3: STFT ----
-                D = self._dsp.transform_frame(waveform_frame)  # complex (n_fft,)
+                D = self._dsp.transform_frame(waveform_frame)
 
                 # ---- P3→P5 adaptor: one-sided magnitude ----
                 mag_onesided = np.abs(D[:n_onesided]).astype(np.float32)
@@ -478,14 +477,12 @@ class EndToEndPipeline:
                 else:
                     S_out, fallback_used = self._run_single_model(active_model, D)
 
-                # ---- Person 3: ISTFT (OLA accumulation) ----
-                # P3 owns this computation — no second ISTFT introduced.
-                frame_td = self._istft_frame(S_out)   # shape (win_len,)
-                pos      = frame_index * hop_len
-                end_pos  = pos + win_len
-                if end_pos <= len(ola_buffer):
-                    ola_buffer[pos:end_pos] += frame_td * window
-                    ola_norm[pos:end_pos]   += window ** 2
+                # ---- Person 3: defer ISTFT / OLA to batch inverse ----
+                # The integration layer performs no synthesis, windowing,
+                # or overlap-add of its own.
+                enhanced_spectra.append(
+                    np.asarray(S_out, dtype=np.complex64)
+                )
 
                 # Collect per-frame diagnostics
                 fv = p5_diag.features
@@ -504,7 +501,7 @@ class EndToEndPipeline:
                     router_state         = decision.router_state.name,
                     active_model         = decision.active_model.value,
                     crossfade_alpha      = float(alpha),
-                    is_transient         = bool(p5_diag.is_transient),
+                    is_transient          = bool(p5_diag.is_transient),
                     dwell_counter        = int(decision.dwell_counter),
                     model_fallback_used  = fallback_used,
                 ))
@@ -515,18 +512,21 @@ class EndToEndPipeline:
         if last_frame is not None:
             D       = self._dsp.transform_frame(last_frame)
             S_out, _ = self._run_single_model(self._p5.active_model, D)
-            frame_td = self._istft_frame(S_out)
-            pos      = frame_index * hop_len
-            end_pos  = pos + win_len
-            if end_pos <= len(ola_buffer):
-                ola_buffer[pos:end_pos] += frame_td * window
-                ola_norm[pos:end_pos]   += window ** 2
+            enhanced_spectra.append(
+                np.asarray(S_out, dtype=np.complex64)
+            )
             frame_index += 1
 
-        # Normalise OLA output (P3 synthesis window normalisation)
-        ola_norm_safe  = np.where(ola_norm > 1e-8, ola_norm, 1.0)
-        enhanced_full  = ola_buffer / ola_norm_safe
-        enhanced_wav   = enhanced_full[:min_len].astype(np.float32)
+        # Person 3 owns ISTFT, synthesis-window handling, and overlap-add.
+        # Perform exactly one batch inverse over the complete enhanced spectrum.
+        if enhanced_spectra:
+            S_all = np.stack(enhanced_spectra, axis=0)
+            enhanced_wav = self._dsp.inverse(
+                S_all,
+                output_length=min_len,
+            ).astype(np.float32)
+        else:
+            enhanced_wav = np.zeros(min_len, dtype=np.float32)
 
         # Post-processing safety:
         #   1. Replace any residual NaN/Inf with 0.0
@@ -558,8 +558,8 @@ class EndToEndPipeline:
             output_length        = min_len,
             nlms_result          = nlms_result,
             frame_diagnostics    = frame_diagnostics,
-            dtln_stats           = self._dtln_stats,
-            dfn_stats            = self._dfn_stats,
+            dtln_stats            = self._dtln_stats,
+            dfn_stats             = self._dfn_stats,
             total_processing_sec = t_pipeline_end - t_pipeline_start,
             audio_duration_sec   = audio_duration,
             dtln_metadata        = self._dtln.metadata,
@@ -589,7 +589,6 @@ class EndToEndPipeline:
         """
         model, stats = self._resolve_model(model_id)
         if model is None:
-            # Model slot has no implementation — pass through
             return D.copy().astype(np.complex64), False
 
         try:
@@ -597,7 +596,6 @@ class EndToEndPipeline:
             return S, False
         except ModelOutputError as exc:
             print(f"[P4] Model failure — {exc}", flush=True)
-            # Mark unavailable through P5's mechanism
             self._mark_model_unavailable(model_id)
             return D.copy().astype(np.complex64), True
 
@@ -632,7 +630,6 @@ class EndToEndPipeline:
         elif model_id == ModelID.DEEP_FILTER_NET:
             return self._dfn, self._dfn_stats
         else:
-            # ModelID.NONE or unknown — pass-through
             return None, None
 
     def _mark_model_unavailable(self, model_id: ModelID) -> None:
@@ -640,19 +637,16 @@ class EndToEndPipeline:
         try:
             self._p5.set_model_available(model_id, False)
         except Exception:
-            pass  # P5 API difference — best-effort
+            pass
 
     def _istft_frame(self, S: np.ndarray) -> np.ndarray:
         """
-        Convert one enhanced complex STFT frame to time domain via P3 ISTFT.
-
-        Person 3 is the sole owner of ISTFT computation.
-        This method is the integration adaptor — no second ISTFT exists here.
-
-        Shape: (n_fft,) → trim to (window_length,)
+        Legacy single-frame adaptor retained for compatibility with any
+        external callers. The main pipeline does NOT use this helper;
+        batch synthesis is owned entirely by Person 3's ``inverse()``.
         """
-        S_2d    = S.reshape(1, -1)          # (1, n_fft)
-        td      = self._dsp.inverse(S_2d)   # P3's ISTFT
+        S_2d = S.reshape(1, -1)
+        td = self._dsp.inverse(S_2d)
         win_len = self._dsp_config.window_length
         return td[:win_len].astype(np.float32)
 
@@ -713,7 +707,7 @@ class EndToEndPipeline:
                 timestamp_sec      = i * hop_len / sample_rate,
                 nlms_snr_db        = None,
                 rms                = fv.rms               if fv else 0.0,
-                zcr                = fv.zcr               if fv else 0.0,
+                zcr                 = fv.zcr               if fv else 0.0,
                 spectral_flux      = fv.spectral_flux     if fv else 0.0,
                 spectral_entropy   = fv.spectral_entropy  if fv else 0.0,
                 centroid_variation = fv.centroid_variation if fv else 0.0,
