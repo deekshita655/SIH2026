@@ -1,0 +1,53 @@
+# ============================================================
+# SIH2026 — .gitignore
+# ============================================================
+
+# ---- Large audio dataset folders (NOT committed to git) ----
+# Too large for GitHub (noisy_speech ~193 MB, clean_speech ~31 MB)
+# Share via Google Drive / OneDrive / network share instead.
+noisy_speech/
+clean_speech/
+
+# Noise reference WAVs are small (1.7 MB total) so they ARE committed.
+# If you want to exclude them too, uncomment:
+# noise/
+
+# ---- Pipeline output (generated, not source) ----
+output/
+
+# ---- Python cache ----
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+
+# ---- Editor / OS ----
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- Model weights (when P4 adds them — commit separately or via LFS) ----
+*.tflite
+*.onnx
+*.pt
+*.pth
+*.h5
+*.pb
+
+# ---- Logs / temp ----
+*.log
+*.tmp
