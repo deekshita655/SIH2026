@@ -123,23 +123,37 @@ class ModelRouter:
         return self._make_decision(frame_index, complexity)
 
     def _handle_startup(self) -> None:
+        preferred = self._router_cfg.default_model
+
+        # Never emit an unavailable active model, even during the startup
+        # hold period.  If the preferred slot is unavailable, select another
+        # usable model immediately; otherwise retain the normal startup
+        # dwell before committing to the preferred model.
+        if not self._health[preferred].is_usable:
+            if self._health[ModelID.DEEP_FILTER_NET].is_usable:
+                selected = ModelID.DEEP_FILTER_NET
+            elif self._health[ModelID.NONE].is_usable:
+                selected = ModelID.NONE
+            else:
+                self._state = RouterState.FALLBACK
+                self._active_model = ModelID.NONE
+                self._requested_model = ModelID.NONE
+                return
+            self._active_model = selected
+            self._requested_model = selected
+            self._state = (
+                RouterState.DFN
+                if selected == ModelID.DEEP_FILTER_NET
+                else RouterState.FALLBACK
+            )
+            return
+
         if self._frame_count < self._router_cfg.startup_frames:
             return
-        preferred = self._router_cfg.default_model
-        if self._health[preferred].is_usable:
-            selected = preferred
-        elif self._health[ModelID.DEEP_FILTER_NET].is_usable:
-            selected = ModelID.DEEP_FILTER_NET
-        elif self._health[ModelID.NONE].is_usable:
-            selected = ModelID.NONE
-        else:
-            self._state = RouterState.FALLBACK
-            self._active_model = ModelID.NONE
-            self._requested_model = ModelID.NONE
-            return
-        self._active_model = selected
-        self._requested_model = selected
-        self._state = RouterState.DTLN if selected == ModelID.DTLN else RouterState.DFN if selected == ModelID.DEEP_FILTER_NET else RouterState.FALLBACK
+
+        self._active_model = preferred
+        self._requested_model = preferred
+        self._state = RouterState.DTLN
 
     def _handle_steady_state(self, complexity: float) -> None:
         signal, _ = self._hysteresis.update(complexity)
