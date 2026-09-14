@@ -278,14 +278,11 @@ class EndToEndPipeline:
         self._dtln: ModelInterface = dtln_model or DTLNStub(cfg.dtln_stub_gain)
         self._dfn:  ModelInterface = dfn_model  or DFNStub(cfg.dfn_stub_gain)
 
-        # Validate sample-rate compatibility
+        # Validate and register sample-rate compatibility with P5.
+        # An incompatible model is unavailable for this pipeline session;
+        # it is never silently run at a rate it does not declare.
         sr = cfg.sample_rate
-        self._validate_model_sr(self._dtln, sr)
-        self._validate_model_sr(self._dfn, sr)
-
-        # Mark both models as available initially (P5 tracks health)
-        self._p5.set_model_available(ModelID.DTLN,          True)
-        self._p5.set_model_available(ModelID.DEEP_FILTER_NET, True)
+        self._refresh_model_availability(sr)
 
         # Performance counters (reset with each process() call)
         self._dtln_stats = ModelPerformanceStats()
@@ -295,21 +292,30 @@ class EndToEndPipeline:
     # Sample-rate validation
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _validate_model_sr(model: ModelInterface, sample_rate: int) -> None:
+    def _refresh_model_availability(self, sample_rate: int) -> None:
         """
-        Warn (do not crash) if a model does not declare support for
-        the requested sample rate.  The model may still work — the
-        metadata is advisory, not enforced.
+        Register model availability for the requested sample rate.
+
+        ModelMetadata is the capability contract.  If a model does not
+        declare support for the pipeline sample rate, P5 is told that the
+        slot is unavailable so its normal fallback behaviour is used.
+        No resampling or silent compatibility override occurs.
         """
-        if not model.supports_sample_rate(sample_rate):
-            print(
-                f"[Pipeline] WARNING: Model {model.name!r} declares "
-                f"supported_sample_rates={model.metadata.supported_sample_rates} "
-                f"but pipeline sample_rate={sample_rate}. "
-                "Proceeding — override ModelMetadata if this is intentional.",
-                flush=True,
-            )
+        for model_id, model in (
+            (ModelID.DTLN, self._dtln),
+            (ModelID.DEEP_FILTER_NET, self._dfn),
+        ):
+            supported = model.supports_sample_rate(sample_rate)
+            if not supported:
+                print(
+                    f"[Pipeline] WARNING: Model {model.name!r} declares "
+                    f"supported_sample_rates={model.metadata.supported_sample_rates} "
+                    f"but pipeline sample_rate={sample_rate}. "
+                    "Marking model unavailable; P5 fallback will be used.",
+                    flush=True,
+                )
+            self._p5.reset_model_health(model_id)
+            self._p5.set_model_available(model_id, supported)
 
     # ------------------------------------------------------------------
     # Session reset
@@ -329,9 +335,10 @@ class EndToEndPipeline:
         self._dtln_stats.reset()
         self._dfn_stats.reset()
 
-        # Re-mark models available after reset
-        self._p5.set_model_available(ModelID.DTLN,          True)
-        self._p5.set_model_available(ModelID.DEEP_FILTER_NET, True)
+        # Restore capability-based availability and clear transient model
+        # health state.  A model that is unsupported at the configured rate
+        # remains unavailable after reset.
+        self._refresh_model_availability(self.config.sample_rate)
 
     # ------------------------------------------------------------------
     # Main processing entry point
@@ -614,7 +621,7 @@ class EndToEndPipeline:
 
         Returns:
             (S_blended, fallback_used)
-        """
+            """
         S_old, fb_old = self._run_single_model(active_model, D)
         S_new, fb_new = self._run_single_model(target_model, D)
         alpha  = float(np.clip(alpha, 0.0, 1.0))
