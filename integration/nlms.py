@@ -132,7 +132,14 @@ class NLMSFilter:
         cleaned_rms = float(np.sqrt(np.mean(cleaned_speech ** 2))) if signal_length else 0.0
         signal_power = float(np.mean(cleaned_speech ** 2)) if signal_length else 0.0
         noise_power = float(np.mean(estimated_noise ** 2)) if signal_length else 0.0
-        nlms_snr_db = 10.0 * np.log10(signal_power / noise_power) if noise_power > 1e-12 else float("inf")
+        # This is a diagnostic/proxy SNR, not ground-truth SNR.  Keep it finite
+        # even when the adaptive filter estimates effectively zero noise.
+        snr_floor = max(float(self.config.epsilon), np.finfo(np.float64).tiny)
+        signal_floor = max(signal_power, snr_floor)
+        noise_floor = max(noise_power, snr_floor)
+        nlms_snr_db = float(10.0 * np.log10(signal_floor / noise_floor))
+        if not np.isfinite(nlms_snr_db):
+            nlms_snr_db = 0.0
         has_nan = bool(np.any(np.isnan(cleaned_speech)) or np.any(np.isnan(estimated_noise)))
         has_inf = bool(np.any(np.isinf(cleaned_speech)) or np.any(np.isinf(estimated_noise)))
 
