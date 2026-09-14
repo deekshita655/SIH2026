@@ -334,27 +334,43 @@ def main():
     print("  DEMO COMPLETE")
     print("=" * 70)
 
-
 def run_router_demo(config: IntegrationConfig):
     """Run the router's synthetic complexity validation sequence."""
-    from person5_acoustic import AcousticPipeline
-    acoustic = AcousticPipeline(config.acoustic)
+    from person5_acoustic import AcousticConfig, ModelID
+    from person5_acoustic.router import ModelRouter
+
+    acoustic_config = AcousticConfig(
+        sample_rate=config.dsp.sample_rate,
+        frame_length=config.dsp.window_length,
+        hop_length=config.dsp.hop_length,
+        fft_size=config.dsp.n_fft,
+    )
+
+    router = ModelRouter(acoustic_config)
+
+    # Synthetic demo requires both models to be available so that
+    # DTLN ↔ DeepFilterNet transitions can actually be exercised.
+    router.set_model_available(ModelID.DEEP_FILTER_NET, True)
+
     sequence = [0.15] * 15 + [0.85] * 15 + [0.15] * 15 + [0.85] * 15
+
     print("  Complexity sequence: low → high → low → high")
-    for i, c in enumerate(sequence):
-        decision = acoustic.process_frame(
+
+    for i, complexity in enumerate(sequence):
+        decision = router.process(
+            complexity=complexity,
             frame_index=i,
-            timestamp_sec=i * 0.01,
-            complexity_override=c,
         )
-        if decision.router_state.name == "TRANSITION" or i in (0, 14, 15, 29, 30, 44, 45, 59):
+
+        if (
+            decision.router_state.name == "TRANSITION"
+            or i in (0, 9, 14, 15, 19, 29, 30, 34, 44, 45, 49, 59)
+        ):
             print(
-                f"  Frame {i:3d}: C={c:.2f} → "
+                f"  Frame {i:3d}: C={complexity:.2f} → "
                 f"{decision.active_model.value:14s} | "
-                f"state={decision.router_state.value:10s} | "
+                f"state={decision.router_state.name:10s} |"
                 f"alpha={decision.crossfade_alpha:.2f}"
             )
-
-
 if __name__ == "__main__":
     main()
